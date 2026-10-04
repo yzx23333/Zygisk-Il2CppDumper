@@ -10,13 +10,16 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -674,9 +677,121 @@ class Writer {
     std::optional<size_t> method_offset_;
     Clock::time_point deadline_{Clock::now() + kDumpTimeout};
 };
+
+// example/dump.cs: Purpleworks.Info::get_IsEmulator() has RVA 0x3c766b4.
+// This is the native equivalent of example/is_emulator_false.js: replace the
+// instance getter with a function that always returns Boolean false.
+constexpr uintptr_t kIsEmulatorGetterRva = 0x3c766b4;
+
+#if defined(__aarch64__)
+constexpr std::array<unsigned char, 8> kReturnFalseCode{
+    0x00, 0x00, 0x80, 0x52, // mov w0, #0
+    0xc0, 0x03, 0x5f, 0xd6  // ret
+};
+#elif defined(__arm__)
+constexpr std::array<unsigned char, 4> kReturnFalseCode{
+    0x00, 0x20, // movs r0, #0
+    0x70, 0x47  // bx lr (Thumb-2)
+};
+#elif defined(__i386__) || defined(__x86_64__)
+constexpr std::array<unsigned char, 3> kReturnFalseCode{
+    0x31, 0xc0, // xor eax, eax
+    0xc3        // ret
+};
+#endif
+
+bool patch_is_emulator_getter(void* handle) {
+#if !defined(__aarch64__) && !defined(__arm__) && !defined(__i386__) && !defined(__x86_64__)
+    (void)handle;
+    LOGE("stage=patch fatal=unsupported-architecture");
+    return false;
+#else
+    if (!handle) {
+        LOGE("stage=patch fatal=null-il2cpp-handle");
+        return false;
+    }
+    xdl_info_t info{};
+    if (xdl_info(handle, XDL_DI_DLINFO, &info) != 0 || !info.dli_fbase) {
+        LOGE("stage=patch fatal=missing-load-bias");
+        return false;
+    }
+    const char* module_path = info.dli_fname;
+    const char* module_name = module_path ? std::strrchr(module_path, '/') : nullptr;
+    module_name = module_name ? module_name + 1 : module_path;
+    const char* module_label = module_name ? module_name : "<unknown>";
+
+    uintptr_t target = reinterpret_cast<uintptr_t>(info.dli_fbase);
+    if (target > std::numeric_limits<uintptr_t>::max() - kIsEmulatorGetterRva)
+        return false;
+    target += kIsEmulatorGetterRva;
+#if defined(__arm__)
+    // Thumb function pointers can carry bit 0; the RVA in dump.cs is a code address.
+    target &= ~uintptr_t{1};
+#endif
+
+    constexpr size_t patch_size = kReturnFalseCode.size();
+    const auto maps = Maps::read_self();
+    const auto* mapping = maps.find(target, patch_size);
+    if (!mapping || !mapping->executable || !mapping->readable) {
+        LOGE("stage=patch fatal=getter-not-executable address=%p", reinterpret_cast<void*>(target));
+        return false;
+    }
+    if (std::memcmp(reinterpret_cast<const void*>(target), kReturnFalseCode.data(), patch_size) ==
+        0) {
+        LOGI("stage=patch already-installed module=%s rva=0x%zx", module_label,
+             static_cast<size_t>(kIsEmulatorGetterRva));
+        return true;
+    }
+
+    const long raw_page_size = sysconf(_SC_PAGESIZE);
+    if (raw_page_size <= 0) {
+        LOGE("stage=patch fatal=invalid-page-size");
+        return false;
+    }
+    const uintptr_t page_size = static_cast<uintptr_t>(raw_page_size);
+    if ((page_size & (page_size - 1)) != 0 ||
+        target > std::numeric_limits<uintptr_t>::max() - patch_size)
+        return false;
+    const uintptr_t page_start = target & ~(page_size - 1);
+    const uintptr_t patch_end = target + patch_size;
+    if (patch_end > std::numeric_limits<uintptr_t>::max() - (page_size - 1))
+        return false;
+    const uintptr_t page_end = (patch_end + page_size - 1) & ~(page_size - 1);
+    if (page_end <= page_start ||
+        page_end - page_start > static_cast<uintptr_t>(std::numeric_limits<size_t>::max()))
+        return false;
+
+    const int original_protection = (mapping->readable ? PROT_READ : 0) |
+                                    (mapping->writable ? PROT_WRITE : 0) |
+                                    (mapping->executable ? PROT_EXEC : 0);
+    if (mprotect(reinterpret_cast<void*>(page_start), page_end - page_start,
+                 original_protection | PROT_WRITE) != 0) {
+        LOGE("stage=patch fatal=mprotect-writable errno=%d", errno);
+        return false;
+    }
+    std::memcpy(reinterpret_cast<void*>(target), kReturnFalseCode.data(), patch_size);
+    __builtin___clear_cache(reinterpret_cast<char*>(target),
+                            reinterpret_cast<char*>(target + patch_size));
+    const int restore_result =
+        mprotect(reinterpret_cast<void*>(page_start), page_end - page_start, original_protection);
+    if (restore_result != 0) {
+        LOGE("stage=patch fatal=mprotect-restore errno=%d", errno);
+        return false;
+    }
+    LOGI("stage=patch complete module=%s rva=0x%zx address=%p return=false", module_label,
+         static_cast<size_t>(kIsEmulatorGetterRva), reinterpret_cast<void*>(target));
+    return true;
+#endif
+}
 } // namespace
 
 bool dump_runtime(void* handle, const std::string& data_directory, const DumpOptions& options) {
+    (void)data_directory;
+    (void)options;
+    // The module now performs the targeted value override instead of writing a
+    // managed API dump. Keep this entry point for the existing Zygisk worker.
+    return patch_is_emulator_getter(handle);
+
     Il2CppApi api;
     std::string error;
     if (!api.load(handle, error)) {
